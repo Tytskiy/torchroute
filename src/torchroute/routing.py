@@ -10,6 +10,14 @@ import torch
 from ._state_dict import install_state_dict_hooks
 
 
+def _add_exception_note(error: Exception, note: str) -> None:
+    add_note = cast(Callable[[str], None] | None, getattr(error, "add_note", None))
+    if add_note is not None:
+        add_note(note)
+    else:
+        error.args = (*error.args, note)
+
+
 class Ref(ABC):
     @abstractmethod
     def resolve(self, *, prev: Any, batch: Any) -> Any: ...
@@ -35,7 +43,7 @@ class _PathRef(Ref):
             try:
                 result = result[value] if kind == "item" else getattr(result, value)
             except Exception as error:
-                error.add_note(f"while resolving {self} at {access}")
+                _add_exception_note(error, f"while resolving {self} at {access}")
                 raise
         return result
 

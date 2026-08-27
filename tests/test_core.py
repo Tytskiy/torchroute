@@ -28,6 +28,14 @@ def test_refs_are_immutable_and_support_item_and_attribute_paths() -> None:
     assert repr(user_id) == "batch['user']['id']"
 
 
+def test_ref_errors_include_the_failing_path() -> None:
+    with pytest.raises(KeyError) as caught:
+        tr.batch["user"]["id"].resolve(prev=None, batch={})
+
+    context = getattr(caught.value, "__notes__", caught.value.args)
+    assert context[-1] == "while resolving batch['user']['id'] at ['user']"
+
+
 def test_module_route_and_route_function_have_the_same_semantics() -> None:
     class Add(tr.Module):
         def forward(self, left: int, right: int, scale: int = 1) -> int:

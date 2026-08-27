@@ -8,7 +8,7 @@ authors = [
 ]
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 keywords = ["deep-learning", "pytorch", "routing", "torch"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -17,6 +17,8 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -48,13 +50,13 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 110
-target-version = "py312"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 files = ["src", "tests"]
 strict = true
 
