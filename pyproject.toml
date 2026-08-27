@@ -1,0 +1,63 @@
+[project]
+name = "torchroute"
+version = "0.1.0"
+description = "Declarative data routing for PyTorch modules."
+readme = "README.md"
+authors = [
+    { name = "Vladislav Tytskiy" },
+]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+keywords = ["deep-learning", "pytorch", "routing", "torch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "torch>=2.2",
+]
+
+[project.urls]
+Issues = "https://github.com/Tytskiy/torchroute/issues"
+Repository = "https://github.com/Tytskiy/torchroute"
+
+[dependency-groups]
+dev = [
+    { include-group = "test" },
+    "mypy>=1.19",
+    "ruff>=0.15",
+]
+test = [
+    "numpy>=1.26",
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.12,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+strict = true
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+testpaths = ["tests"]
