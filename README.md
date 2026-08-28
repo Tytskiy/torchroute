@@ -1,9 +1,9 @@
 # torchroute
 
 [![CI](https://github.com/Tytskiy/torchroute/actions/workflows/ci.yml/badge.svg)](https://github.com/Tytskiy/torchroute/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/torchroute)](https://pypi.org/project/torchroute/)
-[![Python](https://img.shields.io/pypi/pyversions/torchroute)](https://pypi.org/project/torchroute/)
-[![License](https://img.shields.io/pypi/l/torchroute)](https://github.com/Tytskiy/torchroute/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/torchroute.svg)](https://pypi.org/project/torchroute/)
+[![Python](https://img.shields.io/pypi/pyversions/torchroute.svg)](https://pypi.org/project/torchroute/)
+[![License](https://img.shields.io/pypi/l/torchroute.svg)](https://github.com/Tytskiy/torchroute/blob/main/LICENSE)
 
 **Compose PyTorch modules with structured inputs and branches.**
 
@@ -88,8 +88,9 @@ Use `tr.value(...)` when a value should be a complete model step:
 tr.Model(tr.value(42))
 ```
 
-`route(...)` creates a call specification. A torchroute container registers its target and executes it.
-Computed inputs belong in separate container steps, which keeps every trainable module visible to PyTorch.
+`tr.route(...)` is a factory that returns a non-callable `Route` specification. Torchroute containers
+materialize these specifications automatically and register their target modules directly. Computed inputs
+belong in separate container steps, which keeps every trainable module visible to PyTorch.
 
 ## Composition
 
@@ -156,22 +157,22 @@ class MyLayer(tr.Module):
     def forward(self, x, mask): ...
 
 
-call = MyLayer().route(
+spec = MyLayer().route(
     x=tr.prev,
     mask=tr.batch["mask"],
 )
 ```
 
-The function form works with existing modules and arbitrary callables:
+The factory form accepts existing modules and arbitrary callables as targets:
 
 ```python
-call = tr.route(torch.nn.Linear(128, 64), tr.prev)
+spec = tr.route(torch.nn.Linear(128, 64), tr.prev)
 ```
 
 A route can be materialized when it needs to live outside a torchroute container:
 
 ```python
-routed_module = call.as_module()
+routed_module = spec.as_module()
 output = routed_module(x, batch=batch)
 ```
 
@@ -179,7 +180,7 @@ The method can also be enabled for every PyTorch module:
 
 ```python
 tr.enable_module_routes()
-call = torch.nn.Linear(128, 64).route(tr.prev)
+spec = torch.nn.Linear(128, 64).route(tr.prev)
 tr.disable_module_routes()
 ```
 
@@ -224,9 +225,12 @@ tr.NamedParallel(...)
 tr.Sum(...)
 tr.Concat(...)
 
-tr.route(target, ...)
-module.route(...)
-route.as_module()
+spec = tr.route(target, ...)
+spec = module.route(...)  # tr.Module subclasses
+spec.as_module()
+
+tr.enable_module_routes()
+tr.disable_module_routes()
 
 tr.prev
 tr.batch

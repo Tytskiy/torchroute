@@ -49,6 +49,22 @@ def test_module_route_and_route_function_have_the_same_semantics() -> None:
         assert model({"left": 3, "right": 4}) == 14
 
 
+def test_target_can_be_used_as_a_routed_keyword_argument() -> None:
+    class Loss(tr.Module):
+        def forward(self, prediction: int, target: int) -> int:
+            return prediction - target
+
+    routed_method = Loss().route(prediction=tr.batch["prediction"], target=tr.batch["target"])
+    routed_function = tr.route(
+        lambda *, prediction, target: prediction - target,
+        prediction=tr.batch["prediction"],
+        target=tr.batch["target"],
+    )
+
+    for routed in (routed_method, routed_function):
+        assert tr.Model(routed)({"prediction": 7, "target": 2}) == 5
+
+
 def test_route_is_a_non_callable_specification_with_explicit_materialization() -> None:
     linear = torch.nn.Linear(2, 1)
     routed = tr.route(linear, tr.prev)

@@ -93,7 +93,7 @@ class Route:
 
     __slots__ = ("_args", "_kwargs", "_target")
 
-    def __init__(self, target: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+    def __init__(self, target: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
         if not callable(target):
             raise TypeError(f"route target must be callable, got {type(target).__name__}")
 
@@ -146,7 +146,7 @@ def _prepare_route_arguments(item: Any) -> Any:
     return _map_structure(item, validate)
 
 
-def route(target: Callable[..., Any], *args: Any, **kwargs: Any) -> Route:
+def route(target: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Route:
     return Route(target, *args, **kwargs)
 
 
