@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
-from typing import Any, Literal, cast
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol, cast
 
 import torch
-
-from ._state_dict import install_state_dict_hooks
 
 
 def _add_exception_note(error: Exception, note: str) -> None:
@@ -71,20 +69,6 @@ def value(item: Any) -> Ref:
     return _ValueRef(item)
 
 
-def _route_method(self: torch.nn.Module, *args: Any, **kwargs: Any) -> Route:
-    return route(self, *args, **kwargs)
-
-
-class Module(torch.nn.Module):
-    """An ``nn.Module`` with stable ``.route(...)`` syntax."""
-
-    route = _route_method
-
-
-class _Node(Module):
-    """An internal module evaluated with both routing-context values."""
-
-
 def _map_structure(item: Any, map_leaf: Callable[[Any], Any]) -> Any:
     if isinstance(item, tuple):
         return tuple(_map_structure(value, map_leaf) for value in item)
@@ -95,19 +79,31 @@ def _map_structure(item: Any, map_leaf: Callable[[Any], Any]) -> Any:
     return map_leaf(item)
 
 
-class Route(_Node):
-    """An owning module call whose arguments are resolved at execution time."""
+def _resolve_structure(item: Any, *, prev_value: Any, batch_value: Any) -> Any:
+    def resolve(argument: Any) -> Any:
+        if isinstance(argument, Ref):
+            return argument.resolve(prev=prev_value, batch=batch_value)
+        return argument
+
+    return _map_structure(item, resolve)
+
+
+class Route:
+    """A call specification materialized by torchroute containers."""
+
+    __slots__ = ("_args", "_kwargs", "_target")
 
     def __init__(self, target: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
-        super().__init__()
         if not callable(target):
             raise TypeError(f"route target must be callable, got {type(target).__name__}")
 
-        self.target: Callable[..., Any] = target
-        self._inputs = torch.nn.ModuleList()
-        self._args = cast(tuple[Any, ...], _map_structure(args, self._register_input))
-        self._kwargs = cast(dict[str, Any], _map_structure(kwargs, self._register_input))
-        install_state_dict_hooks(self)
+        self._target = target
+        self._args = cast(tuple[Any, ...], _prepare_route_arguments(args))
+        self._kwargs = cast(dict[str, Any], _prepare_route_arguments(kwargs))
+
+    @property
+    def target(self) -> Callable[..., Any]:
+        return self._target
 
     @property
     def args(self) -> tuple[Any, ...]:
@@ -117,26 +113,10 @@ class Route(_Node):
     def kwargs(self) -> Mapping[str, Any]:
         return dict(self._kwargs)
 
-    def _register_input(self, argument: Any) -> Any:
-        if isinstance(argument, _Node):
-            self._inputs.append(argument)
-        return argument
+    def as_module(self) -> Sequential:
+        """Materialize this route as a standalone module."""
 
-    @staticmethod
-    def _resolve(argument: Any, *, prev_value: Any, batch_value: Any) -> Any:
-        if isinstance(argument, Ref):
-            return argument.resolve(prev=prev_value, batch=batch_value)
-        if isinstance(argument, _Node):
-            return argument(prev=prev_value, batch=batch_value)
-        return argument
-
-    def forward(self, prev: Any = None, batch: Any = None) -> Any:
-        def resolve(argument: Any) -> Any:
-            return self._resolve(argument, prev_value=prev, batch_value=batch)
-
-        args = _map_structure(self._args, resolve)
-        kwargs = _map_structure(self._kwargs, resolve)
-        return self.target(*args, **kwargs)
+        return Sequential(self)
 
     def __repr__(self) -> str:
         arguments = [repr(argument) for argument in self.args]
@@ -145,62 +125,178 @@ class Route(_Node):
         return f"route({self.target!r}{separator}{', '.join(arguments)})"
 
 
-def route(target: Callable[..., Any], *args: Any, **kwargs: Any) -> Route:
-    """Create a routed call around a module or callable."""
+def _route_method(self: torch.nn.Module, *args: Any, **kwargs: Any) -> Route:
+    return route(self, *args, **kwargs)
 
+
+class Module(torch.nn.Module):
+    """An ``nn.Module`` with stable ``.route(...)`` syntax."""
+
+    route = _route_method
+
+
+def _prepare_route_arguments(item: Any) -> Any:
+    def validate(argument: Any) -> Any:
+        if isinstance(argument, Route):
+            raise TypeError("route arguments cannot contain another route; make it a separate container step")
+        if isinstance(argument, torch.nn.Module):
+            raise TypeError("route arguments cannot contain an nn.Module; make it a separate container step")
+        return argument
+
+    return _map_structure(item, validate)
+
+
+def route(target: Callable[..., Any], *args: Any, **kwargs: Any) -> Route:
     return Route(target, *args, **kwargs)
 
 
-Step = _Node | Ref | torch.nn.Module | Callable[..., Any]
+class _Plan(Protocol):
+    def run(self, owner: _Container, *, prev_value: Any, batch_value: Any) -> Any: ...
+
+    def exposed(self, owner: _Container) -> Any: ...
 
 
-def _as_node(step: Step) -> _Node:
-    if isinstance(step, _Node):
-        return step
-    if isinstance(step, Ref):
-        return Route(lambda x: x, step)
-    if callable(step):
-        return Route(step, prev)
-    raise TypeError(f"route step must be callable or a reference, got {type(step).__name__}")
+def _invoke(
+    target: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    *,
+    prev_value: Any,
+    batch_value: Any,
+) -> Any:
+    resolved_args = cast(
+        tuple[Any, ...], _resolve_structure(args, prev_value=prev_value, batch_value=batch_value)
+    )
+    resolved_kwargs = cast(
+        dict[str, Any], _resolve_structure(kwargs, prev_value=prev_value, batch_value=batch_value)
+    )
+    return target(*resolved_args, **resolved_kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class _ModulePlan:
+    name: str
+    args: tuple[Any, ...] = ()
+    kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+    def run(self, owner: _Container, *, prev_value: Any, batch_value: Any) -> Any:
+        return _invoke(
+            cast(Callable[..., Any], owner.get_submodule(self.name)),
+            self.args,
+            self.kwargs,
+            prev_value=prev_value,
+            batch_value=batch_value,
+        )
+
+    def exposed(self, owner: _Container) -> Any:
+        return owner.get_submodule(self.name)
+
+
+@dataclass(frozen=True, slots=True)
+class _CallablePlan:
+    target: Callable[..., Any]
+    args: tuple[Any, ...] = ()
+    kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+    def run(self, owner: _Container, *, prev_value: Any, batch_value: Any) -> Any:
+        return _invoke(
+            self.target,
+            self.args,
+            self.kwargs,
+            prev_value=prev_value,
+            batch_value=batch_value,
+        )
+
+    def exposed(self, owner: _Container) -> Any:
+        return self.target
+
+
+@dataclass(frozen=True, slots=True)
+class _RefPlan:
+    ref: Ref
+
+    def run(self, owner: _Container, *, prev_value: Any, batch_value: Any) -> Any:
+        return self.ref.resolve(prev=prev_value, batch=batch_value)
+
+    def exposed(self, owner: _Container) -> Any:
+        return self.ref
+
+
+Step = Route | Ref | torch.nn.Module | Callable[..., Any]
 
 
 def _indexed_steps(steps: tuple[Step, ...]) -> Iterator[tuple[str, Step]]:
     return ((str(index), step) for index, step in enumerate(steps))
 
 
-class _Container(_Node):
+class _Container(Module):
     def __init__(self, entries: Iterable[tuple[str, Step]]) -> None:
         super().__init__()
-        for name, step in entries:
-            self.add_module(name, _as_node(step))
-
-        if not self._modules:
+        plans: list[tuple[str, _Plan]] = [(name, self._prepare_plan(name, step)) for name, step in entries]
+        if not plans:
             raise ValueError(f"{type(self).__name__} requires at least one step")
+        self._plans = tuple(plans)
+
+    def _prepare_target(
+        self,
+        name: str,
+        target: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> _Plan:
+        if isinstance(target, torch.nn.Module):
+            self.add_module(name, target)
+            return _ModulePlan(name, args, kwargs)
+        return _CallablePlan(target, args, kwargs)
+
+    def _prepare_plan(self, name: str, step: Step) -> _Plan:
+        if isinstance(step, Route):
+            return self._prepare_target(name, step.target, step.args, step.kwargs)
+
+        if isinstance(step, Ref):
+            return _RefPlan(step)
+
+        if isinstance(step, _Container):
+            return self._prepare_target(name, step, (prev,), {"batch": batch})
+
+        if isinstance(step, torch.nn.Module):
+            return self._prepare_target(name, step, (prev,), {})
+
+        if callable(step):
+            return self._prepare_target(name, step, (prev,), {})
+
+        raise TypeError(f"route step must be callable or a reference, got {type(step).__name__}")
 
     def __len__(self) -> int:
-        return len(self._modules)
+        return len(self._plans)
 
-    def __iter__(self) -> Iterator[_Node]:
-        return (cast(_Node, module) for module in self._modules.values())
+    def __iter__(self) -> Iterator[Step]:
+        return (cast(Step, plan.exposed(self)) for _, plan in self._plans)
 
-    def __getitem__(self, name: str | int) -> _Node:
+    def __getitem__(self, name: str | int) -> Step:
         if isinstance(name, int):
-            return tuple(self)[name]
-        return cast(_Node, self._modules[name])
+            return cast(Step, self._plans[name][1].exposed(self))
+        for plan_name, plan in self._plans:
+            if plan_name == name:
+                return cast(Step, plan.exposed(self))
+        raise KeyError(name)
+
+    def _execute(self, plan: _Plan, *, prev_value: Any, batch_value: Any) -> Any:
+        return plan.run(self, prev_value=prev_value, batch_value=batch_value)
 
 
 class _Sequence(_Container):
     def __init__(self, *steps: Step) -> None:
         super().__init__(_indexed_steps(steps))
 
-    def _run(self, prev: Any, batch: Any) -> Any:
-        for step in self:
-            prev = step(prev=prev, batch=batch)
-        return prev
+    def _run(self, prev_value: Any, batch_value: Any) -> Any:
+        for _, plan in self._plans:
+            prev_value = self._execute(plan, prev_value=prev_value, batch_value=batch_value)
+        return prev_value
 
 
 class Sequential(_Sequence):
-    def forward(self, prev: Any = None, batch: Any = None) -> Any:
+    def forward(self, prev: Any = None, *, batch: Any = None) -> Any:
         return self._run(prev, batch)
 
 
@@ -208,27 +304,28 @@ class Parallel(_Container):
     def __init__(self, *steps: Step) -> None:
         super().__init__(_indexed_steps(steps))
 
-    def forward(self, prev: Any = None, batch: Any = None) -> tuple[Any, ...]:
-        return tuple(step(prev=prev, batch=batch) for step in self)
+    def forward(self, prev: Any = None, *, batch: Any = None) -> tuple[Any, ...]:
+        return tuple(self._execute(plan, prev_value=prev, batch_value=batch) for _, plan in self._plans)
 
 
 class NamedParallel(_Container):
     def __init__(self, **steps: Step) -> None:
         super().__init__(steps.items())
 
-    def forward(self, prev: Any = None, batch: Any = None) -> dict[str, Any]:
-        return {name: cast(_Node, step)(prev=prev, batch=batch) for name, step in self._modules.items()}
+    def forward(self, prev: Any = None, *, batch: Any = None) -> dict[str, Any]:
+        return {name: self._execute(plan, prev_value=prev, batch_value=batch) for name, plan in self._plans}
 
 
 class Sum(_Container):
     def __init__(self, *steps: Step) -> None:
         super().__init__(_indexed_steps(steps))
 
-    def forward(self, prev: Any = None, batch: Any = None) -> Any:
-        iterator = iter(self)
-        result = next(iterator)(prev=prev, batch=batch)
-        for step in iterator:
-            result = result + step(prev=prev, batch=batch)
+    def forward(self, prev: Any = None, *, batch: Any = None) -> Any:
+        iterator = iter(self._plans)
+        _, first = next(iterator)
+        result = self._execute(first, prev_value=prev, batch_value=batch)
+        for _, plan in iterator:
+            result = result + self._execute(plan, prev_value=prev, batch_value=batch)
         return result
 
 
@@ -237,8 +334,8 @@ class Concat(_Container):
         super().__init__(_indexed_steps(steps))
         self.dim = dim
 
-    def forward(self, prev: Any = None, batch: Any = None) -> torch.Tensor:
-        outputs = [step(prev=prev, batch=batch) for step in self]
+    def forward(self, prev: Any = None, *, batch: Any = None) -> torch.Tensor:
+        outputs = [self._execute(plan, prev_value=prev, batch_value=batch) for _, plan in self._plans]
         return torch.cat(outputs, dim=self.dim)
 
 
@@ -246,7 +343,7 @@ class Model(_Sequence):
     """A batch-only root around a routed computation."""
 
     def forward(self, batch: Any) -> Any:
-        return self._run(prev=None, batch=batch)
+        return self._run(prev_value=None, batch_value=batch)
 
 
 __all__ = [

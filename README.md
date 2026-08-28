@@ -1,6 +1,9 @@
 # torchroute
 
 [![CI](https://github.com/Tytskiy/torchroute/actions/workflows/ci.yml/badge.svg)](https://github.com/Tytskiy/torchroute/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/torchroute)](https://pypi.org/project/torchroute/)
+[![Python](https://img.shields.io/pypi/pyversions/torchroute)](https://pypi.org/project/torchroute/)
+[![License](https://img.shields.io/pypi/l/torchroute)](https://github.com/Tytskiy/torchroute/blob/main/LICENSE)
 
 **Compose PyTorch modules with structured inputs and branches.**
 
@@ -44,34 +47,19 @@ pip install torchroute
 
 `torchroute` supports Python 3.10–3.14 and PyTorch 2.2 or newer.
 
-## Why?
+## Routing
 
-`nn.Sequential` works well when every module consumes the previous module's output. Models with structured
-batches or multiple inputs usually need a custom `forward()`:
-
-```python
-def forward(self, batch):
-    encoded = self.encoder(batch["features"])
-    prediction = self.head(encoded)
-    return self.loss(prediction, batch["target"])
-```
-
-As models grow, this often becomes repetitive. `torchroute` keeps those connections in the model definition
-while the modules themselves stay unchanged.
-
-## How it works
-
-Callables and `nn.Module`s receive the previous step's output automatically:
+An `nn.Sequential` step always receives the previous step's output. Torchroute keeps that default:
 
 ```python
-tr.Model(
+model = tr.Model(
     tr.route(encoder, tr.batch["features"]),
     torch.nn.ReLU(),
     head,
 )
 ```
 
-Use `tr.route(...)` when a step needs other arguments:
+Use `tr.route(...)` when a call needs a different value or more than one argument:
 
 ```python
 tr.route(
@@ -81,25 +69,29 @@ tr.route(
 )
 ```
 
-This is equivalent to calling:
-
-```python
-loss(
-    prediction=prev["prediction"],
-    target=batch["target"],
-)
-```
-
-References can follow nested items and attributes:
+References can follow items and attributes:
 
 ```python
 tr.batch["user"]["profile"].age
 tr.prev["encoder_output"]
 ```
 
-They are resolved when the model runs.
+Regular Python values are passed through unchanged:
 
-## Branches
+```python
+tr.route(torch.mean, tr.prev, dim=-1)
+```
+
+Use `tr.value(...)` when a value should be a complete model step:
+
+```python
+tr.Model(tr.value(42))
+```
+
+`route(...)` creates a call specification. A torchroute container registers its target and executes it.
+Computed inputs belong in separate container steps, which keeps every trainable module visible to PyTorch.
+
+## Composition
 
 `NamedParallel` runs several steps with the same input and returns a dictionary:
 
@@ -119,7 +111,7 @@ model = tr.Model(
 tr.Parallel(branch_a, branch_b)
 ```
 
-`Sum` and `Concat` provide common branch reductions. For example, a residual block can be written as:
+`Sum` and `Concat` provide common branch reductions. A residual block can be written as:
 
 ```python
 block = tr.Sum(
@@ -131,26 +123,21 @@ block = tr.Sum(
 )
 ```
 
-## Structured batches
-
-Different parts of a model can read from the same structured input:
+Nested containers can build larger structures while sharing the original batch:
 
 ```python
 user_tower = tr.Sequential(
-    tr.route(user_embedding, tr.batch["user"]["id"]),
+    tr.route(user_embedding, tr.batch["user_id"]),
     user_encoder,
 )
 
 item_tower = tr.Sequential(
-    tr.route(item_embedding, tr.batch["item"]["id"]),
+    tr.route(item_embedding, tr.batch["item_id"]),
     item_encoder,
 )
 
 model = tr.Model(
-    tr.NamedParallel(
-        user=user_tower,
-        item=item_tower,
-    ),
+    tr.NamedParallel(user=user_tower, item=item_tower),
     tr.route(
         loss,
         user=tr.prev["user"],
@@ -160,53 +147,47 @@ model = tr.Model(
 )
 ```
 
-Routes can also be nested, and regular Python values can be passed directly:
+## `.route(...)` syntax
 
-```python
-tr.route(outer, tr.route(inner, tr.batch["x"]))
-tr.route(torch.mean, tr.prev, dim=-1)
-```
-
-Use `tr.value(...)` to turn a value into a model step:
-
-```python
-tr.Model(tr.value(42))
-```
-
-## Native `.route(...)` syntax
-
-`torchroute` provides a `Module` base class with a `.route(...)` method:
+Subclass `tr.Module` to get a stable `.route(...)` method:
 
 ```python
 class MyLayer(tr.Module):
     def forward(self, x, mask): ...
 
 
-routed = MyLayer().route(
+call = MyLayer().route(
     x=tr.prev,
     mask=tr.batch["mask"],
 )
 ```
 
-The function form works with existing PyTorch modules and arbitrary callables:
+The function form works with existing modules and arbitrary callables:
 
 ```python
-tr.route(torch.nn.Linear(128, 64), tr.prev)
+call = tr.route(torch.nn.Linear(128, 64), tr.prev)
 ```
 
-You can also enable the method for all PyTorch modules:
+A route can be materialized when it needs to live outside a torchroute container:
+
+```python
+routed_module = call.as_module()
+output = routed_module(x, batch=batch)
+```
+
+The method can also be enabled for every PyTorch module:
 
 ```python
 tr.enable_module_routes()
-layer = torch.nn.Linear(128, 64).route(tr.prev)
+call = torch.nn.Linear(128, 64).route(tr.prev)
 tr.disable_module_routes()
 ```
 
-This adds the `route` method to `nn.Module` without changing normal module calls.
+This only adds the method; normal module calls keep their PyTorch behavior.
 
 ## PyTorch integration
 
-Routes and containers support regular PyTorch operations such as:
+Torchroute containers use the regular PyTorch ownership tree:
 
 ```python
 model.parameters()
@@ -215,7 +196,7 @@ model.eval()
 model.to(device)
 ```
 
-Routing wrappers remain transparent in checkpoints:
+Route specifications do not add wrapper levels to parameter names or checkpoint keys:
 
 ```python
 model = tr.Model(
@@ -223,11 +204,16 @@ model = tr.Model(
 )
 
 assert list(model.state_dict()) == ["0.weight", "0.bias"]
+assert list(dict(model.named_parameters())) == ["0.weight", "0.bias"]
 ```
 
-`load_state_dict()` uses the same keys.
+Checkpoints from ordinary PyTorch models load directly when their module paths and tensor shapes match. For
+example, a matching `nn.Sequential` and `tr.Model` use the same numeric paths. Different paths such as
+`encoder.weight` and `0.weight` still require an explicit rename, following the usual PyTorch rules.
 
-## API at a glance
+The same ownership model works with FSDP auto-wrapping and FSDP2 distributed checkpoints.
+
+## API
 
 ```python
 tr.Model(...)
@@ -240,6 +226,7 @@ tr.Concat(...)
 
 tr.route(target, ...)
 module.route(...)
+route.as_module()
 
 tr.prev
 tr.batch

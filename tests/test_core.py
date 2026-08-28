@@ -49,18 +49,24 @@ def test_module_route_and_route_function_have_the_same_semantics() -> None:
         assert model({"left": 3, "right": 4}) == 14
 
 
-def test_route_is_an_owning_module_and_can_be_executed_directly() -> None:
+def test_route_is_a_non_callable_specification_with_explicit_materialization() -> None:
     linear = torch.nn.Linear(2, 1)
     routed = tr.route(linear, tr.prev)
     x = torch.ones(3, 2, requires_grad=True)
 
-    result = routed(prev=x, batch={})
+    with pytest.raises(TypeError, match="not callable"):
+        routed(prev=x, batch={})  # type: ignore[operator]
+
+    materialized = routed.as_module()
+    result = materialized(x, batch={})
     result.sum().backward()
 
     assert result.shape == (3, 1)
-    assert isinstance(routed, torch.nn.Module)
+    assert not isinstance(routed, torch.nn.Module)
+    assert isinstance(materialized, torch.nn.Module)
     assert routed.target is linear
-    assert list(routed.state_dict()) == ["weight", "bias"]
+    assert materialized[0] is linear
+    assert list(materialized.state_dict()) == ["0.weight", "0.bias"]
     assert linear.weight.grad is not None
 
 
@@ -75,24 +81,29 @@ def test_model_is_a_batch_only_sequential_root() -> None:
 
 
 def test_model_is_a_batch_only_sequence() -> None:
-    model = tr.Model(tr.route(lambda x: x + 1, tr.batch["x"]), lambda x: x * 2)
+    def first(x: int) -> int:
+        return x + 1
+
+    def second(x: int) -> int:
+        return x * 2
+
+    model = tr.Model(tr.route(first, tr.batch["x"]), second)
 
     assert len(model) == 2
-    assert isinstance(model[0], tr.Route)
+    assert model[0] is first
+    assert model[1] is second
     assert model({"x": 4}) == 10
 
 
-def test_routes_can_own_nested_routes_in_structured_arguments() -> None:
+def test_nested_routes_are_rejected() -> None:
     inner = tr.route(
         lambda left, right: left + right,
         tr.batch["left"],
         tr.batch["right"],
     )
-    outer = tr.route(lambda values: values["result"], {"result": inner})
-    model = tr.Model(outer)
 
-    assert model({"left": 3, "right": 4}) == 7
-    assert outer._inputs[0] is inner
+    with pytest.raises(TypeError, match="cannot contain another route"):
+        tr.route(lambda values: values["result"], {"result": inner})
 
 
 def test_parallel_and_named_parallel_have_distinct_outputs() -> None:
@@ -149,9 +160,10 @@ def test_module_lifecycle_follows_the_natural_ownership_tree() -> None:
 
     assert list(model.state_dict()) == ["0.weight", "0.bias"]
     assert list(model.named_parameters()) == [
-        ("0.target.weight", linear.weight),
-        ("0.target.bias", linear.bias),
+        ("0.weight", linear.weight),
+        ("0.bias", linear.bias),
     ]
+    assert model[0] is linear
 
     model.eval()
     assert not model.training
@@ -162,30 +174,66 @@ def test_module_lifecycle_follows_the_natural_ownership_tree() -> None:
     assert linear.weight.dtype == torch.float64
 
 
-def test_nested_modules_have_one_natural_ownership_path() -> None:
+def test_trainable_computations_are_explicit_container_steps() -> None:
     inner = torch.nn.Linear(2, 2)
     outer = torch.nn.Linear(2, 1)
-    model = tr.Model(tr.route(outer, tr.route(inner, tr.batch["x"])))
+    model = tr.Model(tr.route(inner, tr.batch["x"]), outer)
 
     assert list(model.state_dict()) == [
         "0.weight",
         "0.bias",
-        "0._inputs.0.weight",
-        "0._inputs.0.bias",
+        "1.weight",
+        "1.bias",
     ]
     assert model({"x": torch.ones(3, 2)}).shape == (3, 1)
 
     clone = tr.Model(
-        tr.route(
-            torch.nn.Linear(2, 1),
-            tr.route(torch.nn.Linear(2, 2), tr.batch["x"]),
-        )
+        tr.route(torch.nn.Linear(2, 2), tr.batch["x"]),
+        torch.nn.Linear(2, 1),
     )
     assert not clone.load_state_dict(model.state_dict()).missing_keys
     assert torch.equal(
         model({"x": torch.ones(3, 2)}),
         clone({"x": torch.ones(3, 2)}),
     )
+
+
+def test_plain_sequential_checkpoint_loads_into_matching_routed_model() -> None:
+    plain = torch.nn.Sequential(
+        torch.nn.Linear(3, 4),
+        torch.nn.ReLU(),
+        torch.nn.Linear(4, 2),
+    )
+    routed = tr.Model(
+        tr.route(torch.nn.Linear(3, 4), tr.batch["x"]),
+        torch.nn.ReLU(),
+        torch.nn.Linear(4, 2),
+    )
+
+    incompatible = routed.load_state_dict(plain.state_dict(), strict=True)
+    inputs = torch.randn(5, 3)
+
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
+    torch.testing.assert_close(routed({"x": inputs}), plain(inputs))
+
+
+def test_checkpoint_compatibility_follows_pytorch_ownership_paths() -> None:
+    class Plain(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder = torch.nn.Linear(3, 2)
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            return cast(torch.Tensor, self.encoder(inputs))
+
+    plain = Plain()
+    routed = tr.Model(tr.route(torch.nn.Linear(3, 2), tr.batch["x"]))
+
+    incompatible = routed.load_state_dict(plain.state_dict(), strict=False)
+
+    assert incompatible.missing_keys == ["0.weight", "0.bias"]
+    assert incompatible.unexpected_keys == ["encoder.weight", "encoder.bias"]
 
 
 def test_shared_modules_follow_normal_pytorch_aliasing() -> None:
@@ -195,8 +243,8 @@ def test_shared_modules_follow_normal_pytorch_aliasing() -> None:
         tr.route(shared, tr.prev),
     )
 
-    assert model[0].target is shared
-    assert model[1].target is shared
+    assert model[0] is shared
+    assert model[1] is shared
     assert list(model.state_dict()) == ["0.weight", "0.bias", "1.weight", "1.bias"]
     assert model({"x": torch.ones(3, 2)}).shape == (3, 2)
 
@@ -219,18 +267,18 @@ def test_transparent_state_dict_preserves_buffers_and_loads_strictly() -> None:
 
     assert incompatible.missing_keys == []
     assert incompatible.unexpected_keys == []
-    target_batch_norm = cast(torch.nn.BatchNorm1d, target[0].target)
-    source_batch_norm = cast(torch.nn.BatchNorm1d, source[0].target)
+    target_batch_norm = cast(torch.nn.BatchNorm1d, target[0])
+    source_batch_norm = cast(torch.nn.BatchNorm1d, source[0])
     assert target_batch_norm.running_mean is not None
     assert source_batch_norm.running_mean is not None
     assert torch.equal(target_batch_norm.running_mean, source_batch_norm.running_mean)
 
 
-def test_route_state_dict_is_transparent_inside_an_ordinary_module() -> None:
+def test_route_can_be_explicitly_materialized_inside_an_ordinary_module() -> None:
     class Wrapper(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.encoder = tr.route(torch.nn.Linear(2, 1), tr.prev)
+            self.encoder = tr.route(torch.nn.Linear(2, 1), tr.prev).as_module()
 
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             return cast(torch.Tensor, self.encoder(prev=value))
@@ -239,7 +287,7 @@ def test_route_state_dict_is_transparent_inside_an_ordinary_module() -> None:
     state = source.state_dict()
     target = Wrapper()
 
-    assert list(state) == ["encoder.weight", "encoder.bias"]
+    assert list(state) == ["encoder.0.weight", "encoder.0.bias"]
     assert not target.load_state_dict(state).missing_keys
     assert torch.equal(source(torch.ones(2, 2)), target(torch.ones(2, 2)))
 
@@ -259,18 +307,12 @@ def test_load_errors_use_transparent_state_names() -> None:
     assert "target" not in str(error.value)
 
 
-def test_nested_inputs_reserve_the_inputs_state_namespace() -> None:
-    class ConflictingTarget(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self._inputs = torch.nn.Linear(2, 2)
-
-        def forward(self, value: torch.Tensor) -> torch.Tensor:
-            return cast(torch.Tensor, self._inputs(value))
-
+def test_route_arguments_reject_hidden_modules() -> None:
     nested = tr.route(torch.nn.Linear(2, 2), tr.batch["x"])
-    with pytest.raises(ValueError, match="cannot have an '_inputs' child"):
-        tr.route(ConflictingTarget(), nested)
+    with pytest.raises(TypeError, match="cannot contain another route"):
+        tr.route(torch.add, nested, tr.prev)
+    with pytest.raises(TypeError, match=r"cannot contain an nn\.Module"):
+        tr.route(lambda module: module, torch.nn.Linear(2, 2))
 
 
 def test_model_supports_torch_compile() -> None:

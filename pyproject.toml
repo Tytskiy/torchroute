@@ -1,6 +1,6 @@
 [project]
 name = "torchroute"
-version = "0.1.1"
+version = "0.2.0"
 description = "Declarative data routing for PyTorch modules."
 readme = "README.md"
 authors = [
