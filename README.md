@@ -35,10 +35,8 @@ and then calls its target.
 
 ## Installation
 
-Until the first PyPI release, install directly from GitHub:
-
 ```console
-pip install "torchroute @ git+https://github.com/Tytskiy/torchroute.git"
+pip install torchroute
 ```
 
 `torchroute` supports Python 3.10–3.14 and PyTorch 2.2 or newer.
