@@ -91,6 +91,26 @@ tr.route(
 )
 ```
 
+Positional and keyword arguments can be mixed just like in a regular Python call:
+
+```python
+class Fuse(torch.nn.Module):
+    def forward(self, x, residual, *, gate, scale):
+        return scale * (gate * x + (1 - gate) * residual)
+
+
+fused = tr.route(
+    Fuse(),
+    tr.prev,
+    tr.batch["residual"],
+    gate=tr.batch["gate"],
+    scale=0.5,
+)
+```
+
+Here `x` comes from the previous step, `residual` and `gate` come from the original input, and `scale`
+is a regular Python value.
+
 References can follow items and attributes:
 
 ```python
