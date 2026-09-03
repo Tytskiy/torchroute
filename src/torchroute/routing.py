@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -19,6 +20,74 @@ def _add_exception_note(error: Exception, note: str) -> None:
 class Ref(ABC):
     @abstractmethod
     def resolve(self, *, prev: Any, batch: Any) -> Any: ...
+
+    def _binary(
+        self,
+        operation: Callable[[Any, Any], Any],
+        symbol: str,
+        other: Any,
+        *,
+        reflected: bool = False,
+    ) -> Ref:
+        left, right = (other, self) if reflected else (self, other)
+        return _expression(operation, f"({{0}} {symbol} {{1}})", left, right)
+
+    def __add__(self, other: Any) -> Ref:
+        return self._binary(operator.add, "+", other)
+
+    def __radd__(self, other: Any) -> Ref:
+        return self._binary(operator.add, "+", other, reflected=True)
+
+    def __sub__(self, other: Any) -> Ref:
+        return self._binary(operator.sub, "-", other)
+
+    def __rsub__(self, other: Any) -> Ref:
+        return self._binary(operator.sub, "-", other, reflected=True)
+
+    def __mul__(self, other: Any) -> Ref:
+        return self._binary(operator.mul, "*", other)
+
+    def __rmul__(self, other: Any) -> Ref:
+        return self._binary(operator.mul, "*", other, reflected=True)
+
+    def __truediv__(self, other: Any) -> Ref:
+        return self._binary(operator.truediv, "/", other)
+
+    def __rtruediv__(self, other: Any) -> Ref:
+        return self._binary(operator.truediv, "/", other, reflected=True)
+
+    def __floordiv__(self, other: Any) -> Ref:
+        return self._binary(operator.floordiv, "//", other)
+
+    def __rfloordiv__(self, other: Any) -> Ref:
+        return self._binary(operator.floordiv, "//", other, reflected=True)
+
+    def __mod__(self, other: Any) -> Ref:
+        return self._binary(operator.mod, "%", other)
+
+    def __rmod__(self, other: Any) -> Ref:
+        return self._binary(operator.mod, "%", other, reflected=True)
+
+    def __pow__(self, other: Any) -> Ref:
+        return self._binary(operator.pow, "**", other)
+
+    def __rpow__(self, other: Any) -> Ref:
+        return self._binary(operator.pow, "**", other, reflected=True)
+
+    def __matmul__(self, other: Any) -> Ref:
+        return self._binary(operator.matmul, "@", other)
+
+    def __rmatmul__(self, other: Any) -> Ref:
+        return self._binary(operator.matmul, "@", other, reflected=True)
+
+    def __neg__(self) -> Ref:
+        return _expression(operator.neg, "(-{0})", self)
+
+    def __pos__(self) -> Ref:
+        return _expression(operator.pos, "(+{0})", self)
+
+    def __abs__(self) -> Ref:
+        return _expression(operator.abs, "abs({0})", self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +213,41 @@ def _prepare_route_arguments(item: Any) -> Any:
         return argument
 
     return _map_structure(item, validate)
+
+
+def _prepare_expression_operand(item: Any) -> Any:
+    def validate(operand: Any) -> Any:
+        if isinstance(operand, Route):
+            raise TypeError("reference expressions cannot contain a route")
+        if isinstance(operand, torch.nn.Module):
+            raise TypeError("reference expressions cannot contain an nn.Module")
+        return operand
+
+    return _map_structure(item, validate)
+
+
+@dataclass(frozen=True)
+class _ExpressionRef(Ref):
+    operation: Callable[..., Any]
+    template: str
+    operands: tuple[Any, ...]
+
+    def resolve(self, *, prev: Any, batch: Any) -> Any:
+        operands = (
+            _resolve_structure(operand, prev_value=prev, batch_value=batch) for operand in self.operands
+        )
+        return self.operation(*operands)
+
+    def __repr__(self) -> str:
+        return self.template.format(*(repr(operand) for operand in self.operands))
+
+
+def _expression(operation: Callable[..., Any], template: str, *operands: Any) -> Ref:
+    return _ExpressionRef(
+        operation,
+        template,
+        tuple(_prepare_expression_operand(operand) for operand in operands),
+    )
 
 
 def route(target: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Route:

@@ -12,32 +12,54 @@ output and `batch` for the model's original input.
 
 ```python
 import torch
+import torch.nn.functional as F
+from torch import nn
+
 import torchroute as tr
 
 
-batch = {
-    "features": torch.randn(32, 128),
-    "target": torch.randn(32, 1),
-}
+backbone = nn.Sequential(
+    nn.Conv2d(3, 16, kernel_size=3, padding=1),
+    nn.ReLU(),
+    nn.AdaptiveAvgPool2d(1),
+    nn.Flatten(),
+)
 
 model = tr.Model(
-    tr.route(torch.nn.Linear(128, 64), tr.batch["features"]),
-    torch.nn.ReLU(),
+    tr.route(backbone, tr.batch["image"]),
     tr.NamedParallel(
-        prediction=torch.nn.Linear(64, 1),
-        target=tr.batch["target"],
+        class_logits=nn.Linear(16, 10),
+        box_prediction=nn.Linear(16, 4),
     ),
-    tr.route(
-        torch.nn.functional.mse_loss,
-        tr.prev["prediction"],
-        tr.prev["target"],
+    tr.NamedParallel(
+        classification_loss=tr.route(
+            F.cross_entropy,
+            tr.prev["class_logits"],
+            tr.batch["class_target"],
+        ),
+        regression_loss=tr.route(
+            F.smooth_l1_loss,
+            tr.prev["box_prediction"],
+            tr.batch["box_target"],
+        ),
+    ),
+    tr.Sum(
+        0.8 * tr.prev["classification_loss"],
+        0.2 * tr.prev["regression_loss"],
     ),
 )
 
+batch = {
+    "image": torch.randn(8, 3, 32, 32),
+    "class_target": torch.randint(0, 10, (8,)),
+    "box_target": torch.randn(8, 4),
+}
+
 loss = model(batch)
+loss.backward()
 ```
 
-The result is an ordinary `torch.nn.Module`.
+`model` is an ordinary `torch.nn.Module`.
 
 ## Installation
 
@@ -75,6 +97,17 @@ References can follow items and attributes:
 tr.batch["user"]["profile"].age
 tr.prev["encoder_output"]
 ```
+
+They also support arithmetic, resolved lazily at runtime:
+
+```python
+tr.Sum(
+    0.8 * tr.prev["classification_loss"],
+    0.2 * tr.prev["regression_loss"],
+)
+```
+
+This includes `+`, `-`, `*`, `/`, `//`, `%`, `**`, `@`, unary `+` and `-`, and `abs(...)`.
 
 Regular Python values are passed through unchanged:
 

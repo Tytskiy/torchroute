@@ -36,6 +36,86 @@ def test_ref_errors_include_the_failing_path() -> None:
     assert context[-1] == "while resolving batch['user']['id'] at ['user']"
 
 
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        (tr.prev + 3, 10),
+        (3 + tr.prev, 10),
+        (tr.prev - 3, 4),
+        (10 - tr.prev, 3),
+        (tr.prev * 3, 21),
+        (3 * tr.prev, 21),
+        (tr.prev / 2, 3.5),
+        (14 / tr.prev, 2),
+        (tr.prev // 3, 2),
+        (20 // tr.prev, 2),
+        (tr.prev % 3, 1),
+        (10 % tr.prev, 3),
+        (tr.prev**2, 49),
+        (2**tr.prev, 128),
+        (-tr.prev, -7),
+        (+tr.prev, 7),
+        (abs(tr.prev - 10), 3),
+    ],
+)
+def test_refs_support_arithmetic(expression: tr.Ref, expected: int | float) -> None:
+    assert expression.resolve(prev=7, batch={}) == expected
+
+
+def test_ref_arithmetic_composes_in_containers_and_preserves_gradients() -> None:
+    classification_loss = torch.tensor(2.0, requires_grad=True)
+    regression_loss = torch.tensor(5.0, requires_grad=True)
+    model = tr.Model(
+        tr.NamedParallel(
+            classification_loss=tr.batch["classification_loss"],
+            regression_loss=tr.batch["regression_loss"],
+        ),
+        tr.Sum(
+            0.8 * tr.prev["classification_loss"],
+            0.2 * tr.prev["regression_loss"],
+        ),
+    )
+
+    loss = model(
+        {
+            "classification_loss": classification_loss,
+            "regression_loss": regression_loss,
+        }
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.tensor(2.6))
+    torch.testing.assert_close(classification_loss.grad, torch.tensor(0.8))
+    torch.testing.assert_close(regression_loss.grad, torch.tensor(0.2))
+
+
+def test_refs_support_matrix_multiplication() -> None:
+    left = torch.tensor([[1.0, 2.0]])
+    right = torch.tensor([[3.0], [4.0]])
+
+    result = (tr.batch["left"] @ tr.batch["right"]).resolve(
+        prev=None,
+        batch={"left": left, "right": right},
+    )
+    reflected_result = (left @ tr.batch["right"]).resolve(prev=None, batch={"right": right})
+
+    torch.testing.assert_close(result, torch.tensor([[11.0]]))
+    torch.testing.assert_close(reflected_result, torch.tensor([[11.0]]))
+
+
+def test_ref_expression_repr_preserves_structure() -> None:
+    expression = 0.8 * tr.prev["classification_loss"] + abs(tr.batch["offset"])
+
+    assert repr(expression) == "((0.8 * prev['classification_loss']) + abs(batch['offset']))"
+
+
+def test_ref_expressions_reject_hidden_computations() -> None:
+    with pytest.raises(TypeError, match="cannot contain a route"):
+        tr.prev + tr.route(lambda value: value, tr.prev)
+    with pytest.raises(TypeError, match=r"cannot contain an nn\.Module"):
+        tr.prev * {"module": torch.nn.Linear(2, 2)}
+
+
 def test_module_route_and_route_function_have_the_same_semantics() -> None:
     class Add(tr.Module):
         def forward(self, left: int, right: int, scale: int = 1) -> int:
@@ -332,7 +412,10 @@ def test_route_arguments_reject_hidden_modules() -> None:
 
 
 def test_model_supports_torch_compile() -> None:
-    model = tr.Model(tr.route(torch.nn.Linear(2, 1), tr.batch["x"]))
+    model = tr.Model(
+        tr.route(torch.nn.Linear(2, 1), tr.batch["x"]),
+        0.5 * tr.prev,
+    )
     compiled = torch.compile(model, backend="eager", fullgraph=True)
 
     assert compiled({"x": torch.ones(3, 2)}).shape == (3, 1)
